@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+const MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 if (!GROQ_API_KEY) {
@@ -105,7 +105,9 @@ app.post('/api/analyze', limiter, async (req, res) => {
     if (!r.ok) {
       const detail = await r.text();
       console.error('Groq error', r.status, detail);
-      return res.status(502).json({ error: 'The analysis service had a problem. Check your API key and model name, then try again.' });
+      let why = '';
+      try { why = JSON.parse(detail).error.message; } catch (_) {}
+      return res.status(502).json({ error: 'Analysis failed' + (why ? ': ' + why : '. Check your API key and model name.') });
     }
 
     const data = await r.json();
