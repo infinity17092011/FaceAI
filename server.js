@@ -1,124 +1,165 @@
-require('dotenv').config();
-const path = require('path');
 const express = require('express');
-const rateLimit = require('express-rate-limit');
-
-const PORT = process.env.PORT || 3000;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-
-if (!GROQ_API_KEY) {
-  console.error('Missing GROQ_API_KEY. Copy .env.example to .env and add your key.');
-  process.exit(1);
-}
-
-const SYSTEM_PROMPT = `You are Healthyness, a friendly face check-in assistant.
-You look at one photo of a person's face and give general, non-diagnostic wellness feedback.
-
-Rules:
-- You are NOT a doctor. Never diagnose a condition. Use wording like "looks like", "may be", "could be".
-- Look at: skin (texture, dryness/oiliness, redness, blemishes, dark spots, sun damage), eyes (redness, puffiness, dark circles, eyelid or white-of-eye changes), lips, brows and hair/scalp if visible.
-- Suggest safe home-care steps only: hydration, sleep, gentle cleansing, moisturizer, SPF, cold compress, warm compress, patch-testing, etc. No prescription drugs, no cutting, popping, or DIY removal of moles, skin tags, or growths.
-- If something could be worth a professional look (a changing or irregular mole, yellowing of skin or eyes, one pupil different from the other, drooping on one side, a sore that won't heal, sudden vision change, severe eye pain), say so clearly under "see_a_professional".
-- If the photo is blurry, dark, has no face, or is heavily filtered, set image_quality.usable to false and explain how to retake it.
-- Be kind, specific and brief. Do not comment on attractiveness, age, ethnicity, or identity.
-
-Reply with ONLY a JSON object, no markdown, in exactly this shape:
-{
-  "image_quality": { "usable": true, "note": "string" },
-  "summary": "2-3 sentence friendly overview",
-  "areas": [
-    { "area": "Skin", "rating": "good | okay | needs attention", "observations": "string" },
-    { "area": "Eyes", "rating": "good | okay | needs attention", "observations": "string" }
-  ],
-  "home_care": [
-    { "title": "string", "why": "string", "steps": ["string", "string"] }
-  ],
-  "see_a_professional": ["string"]
-}`;
+const cors = require('cors');
+const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.set('trust proxy', 1);
-app.use((req, res, next) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-app.use(express.json({ limit: '6mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public'))); // index.html, paywall.html, images
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many checks. Please wait a few minutes and try again.' }
+// ---- Render environment variables ----
+// SUPABASE_URL                 https://xxxx.supabase.co
+// SUPABASE_ANON_KEY            public anon key (safe for the browser)
+// SUPABASE_SERVICE_ROLE_KEY    secret key (server only, never in the browser)
+// PAYPAL_CLIENT_ID             PayPal client ID
+// PAYPAL_CLIENT_SECRET         PayPal secret
+// PAYPAL_ENV                   "live" or "sandbox" (default: live)
+// FREE_ACCESS_EMAILS           comma-separated, e.g. a@x.com,b@y.com
+const {
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  SUPABASE_SERVICE_ROLE_KEY,
+  PAYPAL_CLIENT_ID,
+  PAYPAL_CLIENT_SECRET,
+  PAYPAL_ENV = 'live',
+  FREE_ACCESS_EMAILS = '',
+} = process.env;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
 });
 
-function extractJson(text) {
-  try { return JSON.parse(text); } catch (_) {}
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    try { return JSON.parse(text.slice(start, end + 1)); } catch (_) {}
-  }
-  return null;
+const PAYPAL_API =
+  PAYPAL_ENV === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+
+const freeEmails = new Set(
+  FREE_ACCESS_EMAILS.split(',').map((e) => e.trim().toLowerCase()).filter(Boolean)
+);
+
+// ---------- PayPal ----------
+async function getPaypalToken() {
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  });
+  if (!res.ok) throw new Error('PayPal auth failed');
+  return (await res.json()).access_token;
 }
 
-app.post('/api/analyze', limiter, async (req, res) => {
-  const { image, concern } = req.body || {};
-  if (typeof image !== 'string' || !/^data:image\/(jpeg|png|webp);base64,/.test(image)) {
-    return res.status(400).json({ error: 'Send a JPEG, PNG or WebP image as a data URL.' });
+// Returns the PayPal status (ACTIVE, CANCELLED, SUSPENDED, EXPIRED...) or null if not found
+async function getPaypalStatus(subscriptionID) {
+  if (!subscriptionID) return null;
+  const token = await getPaypalToken();
+  const res = await fetch(
+    `${PAYPAL_API}/v1/billing/subscriptions/${encodeURIComponent(subscriptionID)}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) return null;
+  return (await res.json()).status;
+}
+
+// ---------- Auth ----------
+async function requireUser(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Not logged in' });
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) return res.status(401).json({ error: 'Invalid session' });
+  req.user = data.user;
+  next();
+}
+
+// ---------- Plus status: free email OR active PayPal subscription ----------
+async function getPlus(user) {
+  const email = (user.email || '').toLowerCase();
+  if (email && freeEmails.has(email)) return { plus: true, reason: 'free-access' };
+
+  const { data: row } = await supabase
+    .from('subscriptions').select('*').eq('user_id', user.id).maybeSingle();
+  if (!row) return { plus: false };
+
+  // Re-check with PayPal so cancellations are picked up automatically
+  const status = await getPaypalStatus(row.paypal_subscription_id);
+  if (status && status !== row.status) {
+    await supabase.from('subscriptions')
+      .update({ status, updated_at: new Date().toISOString() }).eq('user_id', user.id);
   }
+  return { plus: (status || row.status) === 'ACTIVE', reason: 'subscription' };
+}
 
-  const userText = concern && typeof concern === 'string'
-    ? `Please check this face photo. The person says: "${concern.slice(0, 300)}"`
-    : 'Please check this face photo.';
+const toProfile = (p) => ({
+  xp: p.xp, streak: p.streak, best: p.best, total: p.total,
+  last: p.last_workout, hist: p.hist || [],
+});
 
+// ---------- Routes ----------
+app.get('/api/config', (req, res) =>
+  res.json({ supabaseUrl: SUPABASE_URL, supabaseAnonKey: SUPABASE_ANON_KEY })
+);
+
+app.get('/api/me', requireUser, async (req, res) => {
   try {
-    const r = await fetch(GROQ_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${GROQ_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0.3,
-        max_tokens: 1400,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: userText },
-              { type: 'image_url', image_url: { url: image } }
-            ]
-          }
-        ]
-      })
-    });
-
-    if (!r.ok) {
-      const detail = await r.text();
-      console.error('Groq error', r.status, detail);
-      let why = '';
-      try { why = JSON.parse(detail).error.message; } catch (_) {}
-      return res.status(502).json({ error: 'Analysis failed' + (why ? ': ' + why : '. Check your API key and model name.') });
+    let { data: profile } = await supabase
+      .from('profiles').select('*').eq('id', req.user.id).maybeSingle();
+    if (!profile) {
+      const ins = await supabase.from('profiles')
+        .insert({ id: req.user.id, email: req.user.email }).select().single();
+      profile = ins.data;
     }
-
-    const data = await r.json();
-    const raw = data.choices?.[0]?.message?.content || '';
-    const result = extractJson(raw);
-    if (!result) return res.status(502).json({ error: 'Could not read the analysis. Please try again.' });
-    res.json(result);
+    const plus = await getPlus(req.user);
+    res.json({ profile: toProfile(profile), ...plus });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.listen(PORT, () => console.log(`Healthyness running at http://localhost:${PORT}`));
+app.put('/api/progress', requireUser, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const int = (v) => Math.max(0, Math.min(1000000, parseInt(v, 10) || 0));
+    const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+    const hist = (Array.isArray(b.hist) ? b.hist : []).filter(isDate).slice(-90);
+    const { error } = await supabase.from('profiles').upsert({
+      id: req.user.id,
+      email: req.user.email,
+      xp: int(b.xp), streak: int(b.streak), best: int(b.best), total: int(b.total),
+      last_workout: isDate(b.last) ? b.last : null,
+      hist,
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not save progress' });
+  }
+});
+
+// Called by the paywall after PayPal approves a subscription
+app.post('/api/subscription', requireUser, async (req, res) => {
+  try {
+    const subscriptionID = String((req.body || {}).subscriptionID || '');
+    const status = await getPaypalStatus(subscriptionID);
+    if (status !== 'ACTIVE') return res.json({ plus: false, status });
+
+    const { error } = await supabase.from('subscriptions').upsert({
+      user_id: req.user.id,
+      paypal_subscription_id: subscriptionID,
+      status,
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw error;
+    res.json({ plus: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ plus: false, error: 'Server error' });
+  }
+});
+
+app.get('/health', (req, res) => res.send('ok'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Mr.Heart server running on ${PORT}`));
